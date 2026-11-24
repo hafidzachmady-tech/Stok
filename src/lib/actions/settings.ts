@@ -19,11 +19,12 @@ export async function saveSettingsAction(
 
   if (!storeName) return { ok: false, error: "Nama toko wajib diisi." };
   if (storeName.length > 80) return { ok: false, error: "Nama toko maksimal 80 karakter." };
-  if (defaultMin === null) return { ok: false, error: "Batas minimum default harus berupa angka tidak negatif." };
+  if (defaultMin === null) {
+    return { ok: false, error: "Batas minimum default harus berupa angka tidak negatif." };
+  }
   if (defaultMin > 10_000) return { ok: false, error: "Batas minimum default terlalu besar." };
 
-  const db = await getDb();
-  const nowIso = new Date().toISOString();
+  const sql = await getDb();
   const values: Array<[string, string]> = [
     ["store_name", storeName],
     ["store_address", storeAddress],
@@ -32,14 +33,19 @@ export async function saveSettingsAction(
   ];
 
   try {
-    await db.batch(
-      values.map(([key, value]) =>
-        db
-          .prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-          .bind(key, value),
-      ),
-    );
-    await auditLog(db, admin.id, admin.full_name, "update_settings", "Memperbarui pengaturan toko");
+    await sql.begin(async (tx) => {
+      for (const [key, value] of values) {
+        await tx`
+          insert into settings (key, value) values (${key}, ${value})
+          on conflict (key) do update set value = excluded.value
+        `;
+      }
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${crypto.randomUUID()}, ${admin.id}, ${admin.full_name}, 'update_settings',
+          'Memperbarui pengaturan toko', now())
+      `;
+    });
     revalidatePath("/pengaturan");
     revalidatePath("/beranda");
     revalidatePath("/belanja");
@@ -52,9 +58,9 @@ export async function saveSettingsAction(
 
 export async function loadDemoDataAction(): Promise<ActionResult> {
   const admin = await requireAdmin();
-  const db = await getDb();
+  const sql = await getDb();
   try {
-    await loadDemoData(db, admin.id, admin.full_name);
+    await loadDemoData(sql, admin.id, admin.full_name);
     revalidatePath("/barang");
     revalidatePath("/beranda");
     revalidatePath("/riwayat");

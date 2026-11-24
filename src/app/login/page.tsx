@@ -3,8 +3,8 @@ import { redirect } from "next/navigation";
 import { LoginForm } from "@/components/LoginForm";
 import { Icon } from "@/components/Icon";
 import { getSessionUser } from "@/lib/auth";
-import { getDb } from "@/lib/db";
-import { isDemoMode } from "@/lib/seed";
+import { describeDatabaseError, getDb } from "@/lib/db";
+import { isDemoMode } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -14,19 +14,19 @@ export default async function LoginPage() {
   const user = await getSessionUser();
   if (user) redirect("/beranda");
 
-  const demoMode = await isDemoMode();
+  const demoMode = isDemoMode();
 
-  // Deteksi database yang belum memiliki akun sama sekali (provisioning belum
-  // dijalankan pada deployment produksi) agar admin tidak menemui jalan buntu.
+  // Sekaligus mendeteksi database yang belum punya akun (provisioning belum
+  // dijalankan) dan kegagalan koneksi, agar admin tidak menemui jalan buntu
+  // tanpa penjelasan saat deployment baru.
   let needsSetup = false;
-  if (!demoMode) {
-    try {
-      const db = await getDb();
-      const row = await db.prepare("SELECT COUNT(*) AS n FROM profiles").first<{ n: number }>();
-      needsSetup = (row?.n ?? 0) === 0;
-    } catch {
-      needsSetup = false;
-    }
+  let dbError: string | null = null;
+  try {
+    const sql = await getDb();
+    const rows = await sql<{ n: number }[]>`select count(*)::int as n from profiles`;
+    needsSetup = (rows[0]?.n ?? 0) === 0;
+  } catch (error) {
+    dbError = describeDatabaseError(error);
   }
 
   return (
@@ -90,7 +90,15 @@ export default async function LoginPage() {
             <p className="mt-1 mb-6 text-sm text-muted">
               Gunakan akun yang diberikan admin toko.
             </p>
-            {needsSetup ? (
+            {dbError ? (
+              <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-warn-line bg-warn-bg px-3.5 py-3 text-sm text-warn">
+                <Icon name="alert" size={18} className="mt-0.5 shrink-0" />
+                <span>
+                  <b>Koneksi database gagal.</b> {dbError}
+                </span>
+              </div>
+            ) : null}
+            {needsSetup && !dbError ? (
               <div className="mb-4 flex items-start gap-2.5 rounded-xl border border-warn-line bg-warn-bg px-3.5 py-3 text-sm text-warn">
                 <Icon name="alert" size={18} className="mt-0.5 shrink-0" />
                 <span>

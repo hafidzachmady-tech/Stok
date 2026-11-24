@@ -23,6 +23,23 @@ function passwordError(password: string): string | null {
   return null;
 }
 
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "23505"
+  );
+}
+
+type TargetRow = {
+  id: string;
+  full_name: string;
+  username: string;
+  role: "admin" | "penjaga";
+  is_active: number;
+};
+
 export async function createUserAction(
   _prev: ActionResult | null,
   formData: FormData,
@@ -41,40 +58,30 @@ export async function createUserAction(
   if (pErr) return { ok: false, error: pErr };
   if (!isRole(role)) return { ok: false, error: "Peran pengguna tidak valid." };
 
-  const db = await getDb();
-  const existing = await db
-    .prepare("SELECT id FROM profiles WHERE username = ?")
-    .bind(username)
-    .first<{ id: string }>();
-  if (existing) return { ok: false, error: `Username "${username}" sudah digunakan.` };
+  const sql = await getDb();
+  const existing = await sql<{ id: string }[]>`select id from profiles where username = ${username}`;
+  if (existing[0]) return { ok: false, error: `Username "${username}" sudah digunakan.` };
 
   try {
-    const nowIso = new Date().toISOString();
     const passwordHash = await hashPassword(password);
-    await db.batch([
-      db
-        .prepare(
-          `INSERT INTO profiles (id, full_name, username, password_hash, role, is_active, created_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?)`,
-        )
-        .bind(newId(), fullName, username, passwordHash, role, nowIso),
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          admin.id,
-          admin.full_name,
-          "create_user",
-          `Menambahkan akun ${role} dengan username ${username}`,
-          nowIso,
-        ),
-    ]);
+    await sql.begin(async (tx) => {
+      await tx`
+        insert into profiles (id, full_name, username, password_hash, role, is_active, created_at)
+        values (${newId()}, ${fullName}, ${username}, ${passwordHash}, ${role}, 1, now())
+      `;
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${admin.id}, ${admin.full_name}, 'create_user',
+          ${`Menambahkan akun ${role} dengan username ${username}`}, now())
+      `;
+    });
     revalidatePath("/pengguna");
     revalidatePath("/pengaturan");
     return { ok: true, message: `Akun "${username}" berhasil dibuat.` };
   } catch (error) {
+    if (isUniqueViolation(error)) {
+      return { ok: false, error: `Username "${username}" sudah digunakan.` };
+    }
     console.error("createUserAction", error);
     return { ok: false, error: "Gagal membuat akun. Coba lagi." };
   }
@@ -95,11 +102,11 @@ export async function updateUserAction(
   if (fullName.length > 80) return { ok: false, error: "Nama lengkap maksimal 80 karakter." };
   if (!isRole(role)) return { ok: false, error: "Peran pengguna tidak valid." };
 
-  const db = await getDb();
-  const target = await db
-    .prepare("SELECT id, full_name, username, role, is_active FROM profiles WHERE id = ?")
-    .bind(id)
-    .first<{ id: string; full_name: string; username: string; role: string; is_active: number }>();
+  const sql = await getDb();
+  const rows = await sql<TargetRow[]>`
+    select id, full_name, username, role, is_active from profiles where id = ${id}
+  `;
+  const target = rows[0];
   if (!target) return { ok: false, error: "Pengguna tidak ditemukan." };
 
   if (target.id === admin.id) {
@@ -108,39 +115,27 @@ export async function updateUserAction(
   }
 
   if (target.role === "admin" && (role !== "admin" || !isActive)) {
-    const activeAdmins = await db
-      .prepare("SELECT COUNT(*) AS n FROM profiles WHERE role = 'admin' AND is_active = 1")
-      .first<{ n: number }>();
-    if ((activeAdmins?.n ?? 0) <= 1) {
+    const activeAdmins = await sql<{ n: number }[]>`
+      select count(*)::int as n from profiles where role = 'admin' and is_active = 1
+    `;
+    if ((activeAdmins[0]?.n ?? 0) <= 1) {
       return { ok: false, error: "Minimal harus ada satu admin aktif. Tambahkan admin lain terlebih dahulu." };
     }
   }
 
   try {
-    const nowIso = new Date().toISOString();
-    const statements = [
-      db
-        .prepare("UPDATE profiles SET full_name = ?, role = ?, is_active = ? WHERE id = ?")
-        .bind(fullName, role, isActive, id),
-    ];
-    if (!isActive) {
-      statements.push(db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id));
-    }
-    statements.push(
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          admin.id,
-          admin.full_name,
-          "update_user",
-          `Mengubah akun ${target.username}: nama "${fullName}", peran ${role}, status ${isActive ? "aktif" : "nonaktif"}`,
-          nowIso,
-        ),
-    );
-    await db.batch(statements);
+    await sql.begin(async (tx) => {
+      await tx`update profiles set full_name = ${fullName}, role = ${role}, is_active = ${isActive} where id = ${id}`;
+      if (!isActive) {
+        await tx`delete from sessions where user_id = ${id}`;
+      }
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${admin.id}, ${admin.full_name}, 'update_user',
+          ${`Mengubah akun ${target.username}: nama "${fullName}", peran ${role}, status ${isActive ? "aktif" : "nonaktif"}`},
+          now())
+      `;
+    });
     revalidatePath("/pengguna");
     revalidatePath("/pengaturan");
     return { ok: true, message: `Akun "${target.username}" berhasil diperbarui.` };
@@ -155,43 +150,34 @@ export async function toggleUserActiveAction(id: string, nextActive: boolean): P
   if (!id) return { ok: false, error: "Pengguna tidak ditemukan." };
   if (id === admin.id) return { ok: false, error: "Anda tidak dapat menonaktifkan akun sendiri." };
 
-  const db = await getDb();
-  const target = await db
-    .prepare("SELECT id, username, role, is_active FROM profiles WHERE id = ?")
-    .bind(id)
-    .first<{ id: string; username: string; role: string; is_active: number }>();
+  const sql = await getDb();
+  const rows = await sql<{ id: string; username: string; role: string; is_active: number }[]>`
+    select id, username, role, is_active from profiles where id = ${id}
+  `;
+  const target = rows[0];
   if (!target) return { ok: false, error: "Pengguna tidak ditemukan." };
 
   if (!nextActive && target.role === "admin") {
-    const activeAdmins = await db
-      .prepare("SELECT COUNT(*) AS n FROM profiles WHERE role = 'admin' AND is_active = 1")
-      .first<{ n: number }>();
-    if ((activeAdmins?.n ?? 0) <= 1) {
+    const activeAdmins = await sql<{ n: number }[]>`
+      select count(*)::int as n from profiles where role = 'admin' and is_active = 1
+    `;
+    if ((activeAdmins[0]?.n ?? 0) <= 1) {
       return { ok: false, error: "Minimal harus ada satu admin aktif." };
     }
   }
 
   try {
-    const nowIso = new Date().toISOString();
-    const statements = [
-      db.prepare("UPDATE profiles SET is_active = ? WHERE id = ?").bind(nextActive ? 1 : 0, id),
-    ];
-    if (!nextActive) statements.push(db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id));
-    statements.push(
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          admin.id,
-          admin.full_name,
-          "update_user_status",
-          `${nextActive ? "Mengaktifkan" : "Menonaktifkan"} akun ${target.username}`,
-          nowIso,
-        ),
-    );
-    await db.batch(statements);
+    await sql.begin(async (tx) => {
+      await tx`update profiles set is_active = ${nextActive ? 1 : 0} where id = ${id}`;
+      if (!nextActive) {
+        await tx`delete from sessions where user_id = ${id}`;
+      }
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${admin.id}, ${admin.full_name}, 'update_user_status',
+          ${`${nextActive ? "Mengaktifkan" : "Menonaktifkan"} akun ${target.username}`}, now())
+      `;
+    });
     revalidatePath("/pengguna");
     return {
       ok: true,
@@ -217,33 +203,28 @@ export async function resetPasswordAction(
   if (pErr) return { ok: false, error: pErr };
   if (password !== confirm) return { ok: false, error: "Konfirmasi password tidak sama." };
 
-  const db = await getDb();
-  const target = await db
-    .prepare("SELECT id, username FROM profiles WHERE id = ?")
-    .bind(id)
-    .first<{ id: string; username: string }>();
+  const sql = await getDb();
+  const rows = await sql<{ id: string; username: string }[]>`
+    select id, username from profiles where id = ${id}
+  `;
+  const target = rows[0];
   if (!target) return { ok: false, error: "Pengguna tidak ditemukan." };
 
   try {
     const passwordHash = await hashPassword(password);
-    const nowIso = new Date().toISOString();
-    await db.batch([
-      db.prepare("UPDATE profiles SET password_hash = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?").bind(passwordHash, id),
+    await sql.begin(async (tx) => {
+      await tx`
+        update profiles set password_hash = ${passwordHash}, failed_attempts = 0, locked_until = null
+        where id = ${id}
+      `;
       // Semua sesi lama dicabut setelah password diatur ulang.
-      db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(id),
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          admin.id,
-          admin.full_name,
-          "reset_password",
-          `Mengatur ulang password akun ${target.username}`,
-          nowIso,
-        ),
-    ]);
+      await tx`delete from sessions where user_id = ${id}`;
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${admin.id}, ${admin.full_name}, 'reset_password',
+          ${`Mengatur ulang password akun ${target.username}`}, now())
+      `;
+    });
     revalidatePath("/pengguna");
     revalidatePath("/pengaturan");
     return {
