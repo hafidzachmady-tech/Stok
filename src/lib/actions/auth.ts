@@ -11,7 +11,7 @@ import {
   getSessionUser,
   sessionCookieOptions,
 } from "../auth";
-import { getDb } from "../db";
+import { describeDatabaseError, getDb } from "../db";
 import type { ActionResult } from "../types";
 import { rawStr } from "../validate";
 
@@ -34,10 +34,7 @@ export async function loginAction(
     result = await checkCredentials(username, password);
   } catch (error) {
     console.error("loginAction", error);
-    return {
-      ok: false,
-      error: "Gagal menghubungi server atau database. Periksa koneksi lalu coba lagi.",
-    };
+    return { ok: false, error: describeDatabaseError(error) };
   }
 
   if (!result.ok) {

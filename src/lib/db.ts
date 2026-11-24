@@ -1,5 +1,5 @@
 import postgres from "postgres";
-import { getDatabaseUrl } from "./env";
+import { getDatabaseUrl, hasDatabaseUrl } from "./env";
 import { seedDefaults } from "./seed";
 
 export type Database = ReturnType<typeof postgres>;
@@ -114,6 +114,51 @@ function buildClient(url: string): Database {
     ssl: sslDisabled || isLocal ? false : true,
     onnotice: () => {},
   });
+}
+
+/**
+ * Menerjemahkan kegagalan koneksi database menjadi petunjuk yang bisa
+ * ditindaklanjuti admin. Sengaja tidak menyertakan host, nama pengguna, atau
+ * password agar halaman publik tidak membocorkan detail kredensial.
+ */
+export function describeDatabaseError(error: unknown): string {
+  if (!hasDatabaseUrl()) {
+    return "DATABASE_URL belum diatur pada deployment ini. Tambahkan connection string PostgreSQL (Supabase) di environment variable, lalu deploy ulang.";
+  }
+
+  const code =
+    typeof error === "object" && error !== null && "code" in error
+      ? String((error as { code?: unknown }).code ?? "")
+      : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const haystack = `${code} ${message}`.toUpperCase();
+
+  if (haystack.includes("ENOTFOUND") || haystack.includes("GETADDRINFO")) {
+    return "Hostname database tidak ditemukan. Periksa kembali DATABASE_URL — salin ulang connection string dari Supabase tanpa mengubah apa pun.";
+  }
+  if (haystack.includes("ECONNREFUSED")) {
+    return "Database menolak koneksi. Pastikan DATABASE_URL memakai connection string Connection pooling (port 6543), bukan Direct connection.";
+  }
+  if (haystack.includes("ETIMEDOUT") || haystack.includes("TIMEOUT")) {
+    return "Koneksi ke database melewati batas waktu. Project Supabase mungkin sedang dijeda (pause) — buka dashboard Supabase untuk mengaktifkannya kembali.";
+  }
+  if (haystack.includes("28P01") || haystack.includes("PASSWORD AUTHENTICATION FAILED")) {
+    return "Password database ditolak. Perbarui password pada DATABASE_URL; karakter khusus seperti @ # / ? : harus di-URL-encode.";
+  }
+  if (haystack.includes("3D000") || haystack.includes("DATABASE ") && haystack.includes("DOES NOT EXIST")) {
+    return "Database tujuan tidak ditemukan. Connection pooling Supabase memakai nama database /postgres.";
+  }
+  if (haystack.includes("53300") || haystack.includes("TOO MANY CONNECTIONS") || haystack.includes("REMAINING CONNECTION SLOTS")) {
+    return "Koneksi database penuh. Gunakan pooler port 6543 dan set DATABASE_POOL_MAX=1.";
+  }
+  if (haystack.includes("42P01") || haystack.includes("RELATION") && haystack.includes("DOES NOT EXIST")) {
+    return "Tabel database belum tersedia. Jalankan isi db/schema.sql di SQL Editor Supabase, lalu muat ulang halaman ini.";
+  }
+  if (haystack.includes("SELF-SIGNED") || haystack.includes("SSL")) {
+    return "Koneksi SSL ke database ditolak. Gunakan hostname Supabase (bukan alamat IP) pada DATABASE_URL.";
+  }
+
+  return "Gagal menghubungi server atau database. Periksa koneksi lalu coba lagi.";
 }
 
 export function getSql(): Database {
