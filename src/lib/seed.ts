@@ -1,5 +1,5 @@
-import type { D1Database } from "@cloudflare/workers-types";
-import { getEnv } from "./env";
+import type { Database } from "./db";
+import { isDemoMode } from "./env";
 import { hashPassword, newId } from "./password";
 import { isoAt, daysAgoKey } from "./date";
 
@@ -66,49 +66,49 @@ const DEMO_FINAL_TARGET: Record<string, number> = {
   BRG008: 12,
 };
 
-async function insertDemoData(db: D1Database, adminId: string, adminName: string) {
-  const nowIso = new Date().toISOString();
+type TxRow = {
+  id: string;
+  product_id: string;
+  product_name: string;
+  product_code: string;
+  transaction_type: "masuk" | "keluar";
+  quantity: number;
+  stock_before: number;
+  stock_after: number;
+  note: string;
+  user_id: string;
+  user_name: string;
+  created_at: string;
+};
+
+export async function insertDemoData(
+  sql: Database,
+  adminId: string,
+  adminName: string,
+): Promise<void> {
   const productIds = new Map<string, string>();
-  const stocks = new Map<string, number>();
-
-  const statements: D1PreparedStatement[] = [];
-  for (const p of DEMO_PRODUCTS) {
+  const productRows = DEMO_PRODUCTS.map((product) => {
     const id = newId();
-    productIds.set(p.code, id);
-    stocks.set(p.code, p.stock);
-    statements.push(
-      db
-        .prepare(
-          `INSERT INTO products (id, product_code, name, category, unit, purchase_price, selling_price, stock, minimum_stock, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(id, p.code, p.name, p.category, p.unit, p.purchase_price, p.selling_price, p.stock, p.minimum_stock, nowIso, nowIso),
-    );
-  }
-  if (statements.length) await db.batch(statements);
+    productIds.set(product.code, id);
+    return {
+      id,
+      product_code: product.code,
+      name: product.name,
+      category: product.category,
+      unit: product.unit,
+      purchase_price: product.purchase_price,
+      selling_price: product.selling_price,
+      stock: product.stock,
+      minimum_stock: product.minimum_stock,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+  });
 
-  type Tx = {
-    productId: string;
-    name: string;
-    code: string;
-    type: "masuk" | "keluar";
-    qty: number;
-    before: number;
-    after: number;
-    note: string;
-    createdAt: string;
-  };
+  const simulation = new Map(DEMO_PRODUCTS.map((product) => [product.code, product.stock]));
+  const transactions: TxRow[] = [];
 
-  const simulation = new Map(stocks);
-  const txs: Tx[] = [];
-
-  const apply = (
-    code: string,
-    type: "masuk" | "keluar",
-    qty: number,
-    note: string,
-    daysAgo: number,
-  ) => {
+  const apply = (code: string, type: "masuk" | "keluar", qty: number, note: string, daysAgo: number) => {
     const product = DEMO_PRODUCTS.find((item) => item.code === code);
     const productId = productIds.get(code);
     if (!product || !productId || qty <= 0) return;
@@ -116,16 +116,19 @@ async function insertDemoData(db: D1Database, adminId: string, adminName: string
     if (type === "keluar" && qty > before) return;
     const after = type === "masuk" ? before + qty : before - qty;
     simulation.set(code, after);
-    txs.push({
-      productId,
-      name: product.name,
-      code,
-      type,
-      qty,
-      before,
-      after,
+    transactions.push({
+      id: newId(),
+      product_id: productId,
+      product_name: product.name,
+      product_code: code,
+      transaction_type: type,
+      quantity: qty,
+      stock_before: before,
+      stock_after: after,
       note,
-      createdAt: isoAt(daysAgoKey(daysAgo), 9 + (qty % 8), (qty * 7) % 60),
+      user_id: adminId,
+      user_name: adminName,
+      created_at: isoAt(daysAgoKey(daysAgo), 9 + (qty % 8), (qty * 7) % 60),
     });
   };
 
@@ -133,69 +136,42 @@ async function insertDemoData(db: D1Database, adminId: string, adminName: string
     apply(code, type, qty, note, daysAgo);
   }
 
-  // Transaksi penyesuaian dihitung dari stok hasil simulasi agar stok akhir
-  // demo sesuai target (ada barang menipis dan habis).
-  for (const p of DEMO_PRODUCTS) {
-    const target = DEMO_FINAL_TARGET[p.code];
+  // Penyesuaian agar stok akhir demo sesuai target (ada yang menipis & habis),
+  // dibagi ke beberapa hari supaya grafik tetap wajar.
+  for (const product of DEMO_PRODUCTS) {
+    const target = DEMO_FINAL_TARGET[product.code];
     if (target === undefined) continue;
-    const current = simulation.get(p.code) ?? 0;
+    const current = simulation.get(product.code) ?? 0;
     if (current < target) {
-      apply(p.code, "masuk", target - current, "Penyesuaian stok", 1);
+      apply(product.code, "masuk", target - current, "Penyesuaian stok", 1);
       continue;
     }
     let remaining = current - target;
     let step = 0;
     while (remaining > 0 && step < 6) {
       const part = Math.ceil(remaining / 2);
-      apply(p.code, "keluar", part, "Penjualan harian", 1 + (step % 3));
+      apply(product.code, "keluar", part, "Penjualan harian", 1 + (step % 3));
       remaining -= part;
       step += 1;
     }
   }
 
-  const txStatements: D1PreparedStatement[] = txs.map((tx) =>
-    db
-      .prepare(
-        `INSERT INTO stock_transactions (id, product_id, product_name, product_code, transaction_type, quantity, stock_before, stock_after, note, user_id, user_name, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        newId(),
-        tx.productId,
-        tx.name,
-        tx.code,
-        tx.type,
-        tx.qty,
-        tx.before,
-        tx.after,
-        tx.note,
-        adminId,
-        adminName,
-        tx.createdAt,
-      ),
-  );
-
-  stocks.clear();
-  for (const [code, stock] of simulation) stocks.set(code, stock);
-
-  const finalStatements: D1PreparedStatement[] = [];
-  for (const [code, stock] of stocks) {
-    const productId = productIds.get(code);
-    if (!productId) continue;
-    finalStatements.push(
-      db.prepare("UPDATE products SET stock = ?, updated_at = ? WHERE id = ?").bind(stock, nowIso, productId),
-    );
-  }
-
-  if (txStatements.length) await db.batch(txStatements);
-  if (finalStatements.length) await db.batch(finalStatements);
-
-  await db
-    .prepare(
-      `INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(newId(), adminId, adminName, "seed_demo", "Memuat data contoh barang dan riwayat transaksi", nowIso)
-    .run();
+  await sql.begin(async (tx) => {
+    await tx`insert into products ${tx(productRows)}`;
+    if (transactions.length > 0) {
+      await tx`insert into stock_transactions ${tx(transactions)}`;
+    }
+    for (const [code, stock] of simulation) {
+      const id = productIds.get(code);
+      if (!id) continue;
+      await tx`update products set stock = ${stock}, updated_at = now() where id = ${id}`;
+    }
+    await tx`
+      insert into audit_logs (id, user_id, user_name, action, description, created_at)
+      values (${newId()}, ${adminId}, ${adminName}, 'seed_demo',
+        'Memuat data contoh barang dan riwayat transaksi', now())
+    `;
+  });
 }
 
 /**
@@ -203,65 +179,53 @@ async function insertDemoData(db: D1Database, adminId: string, adminName: string
  * - DEMO_MODE=1 (demo/preview) atau lingkungan pengembangan: akun demo
  *   admin/admin beserta data contoh dibuat agar dashboard tidak kosong.
  * - Produksi: admin dibuat HANYA bila ADMIN_PASSWORD disediakan melalui
- *   environment variable, dan tanpa data contoh (harus disetujui admin
- *   lewat halaman Pengaturan).
+ *   environment variable, dan tanpa data contoh.
  */
-export async function seedDefaults(db: D1Database): Promise<void> {
-  const existing = await db.prepare("SELECT COUNT(*) AS n FROM profiles").first<{ n: number }>();
-  if ((existing?.n ?? 0) > 0) return;
+export async function seedDefaults(sql: Database): Promise<void> {
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from profiles`;
+  if ((rows[0]?.n ?? 0) > 0) return;
 
-  const env = await getEnv();
-  const isDev = process.env.NODE_ENV !== "production";
-  const demoMode = env.DEMO_MODE === "1" || env.DEMO_MODE === "true";
-  const nowIso = new Date().toISOString();
+  const demo = isDemoMode();
+  const adminPassword = process.env.ADMIN_PASSWORD || "";
+  const adminUsername = (process.env.ADMIN_USERNAME || "admin").trim().toLowerCase() || "admin";
   const adminId = newId();
+  const adminName = "Admin Toko";
 
-  if (demoMode || isDev) {
-    const username = (env.ADMIN_USERNAME || "admin").trim().toLowerCase() || "admin";
-    const password = env.ADMIN_PASSWORD || "admin";
-    const passwordHash = await hashPassword(password);
-    await db
-      .prepare(
-        `INSERT INTO profiles (id, full_name, username, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, 'admin', 1, ?)`,
-      )
-      .bind(adminId, "Admin Toko", username, passwordHash, nowIso)
-      .run();
-    await insertDemoData(db, adminId, "Admin Toko");
+  if (demo) {
+    const passwordHash = await hashPassword(adminPassword || "admin");
+    await sql`
+      insert into profiles (id, full_name, username, password_hash, role, is_active, created_at)
+      values (${adminId}, ${adminName}, ${adminUsername}, ${passwordHash}, 'admin', 1, now())
+    `;
+    await insertDemoData(sql, adminId, adminName);
     return;
   }
 
-  if (env.ADMIN_PASSWORD && env.ADMIN_PASSWORD.length >= 8) {
-    const username = (env.ADMIN_USERNAME || "admin").trim().toLowerCase() || "admin";
-    const passwordHash = await hashPassword(env.ADMIN_PASSWORD);
-    await db
-      .prepare(
-        `INSERT INTO profiles (id, full_name, username, password_hash, role, is_active, created_at) VALUES (?, ?, ?, ?, 'admin', 1, ?)`,
-      )
-      .bind(adminId, "Admin Toko", username, passwordHash, nowIso)
-      .run();
-    await db
-      .prepare(
-        `INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(newId(), adminId, "Admin Toko", "provision_admin", "Akun admin dibuat dari environment variable", nowIso)
-      .run();
+  if (adminPassword.length >= 8) {
+    const passwordHash = await hashPassword(adminPassword);
+    await sql`
+      insert into profiles (id, full_name, username, password_hash, role, is_active, created_at)
+      values (${adminId}, ${adminName}, ${adminUsername}, ${passwordHash}, 'admin', 1, now())
+    `;
+    await sql`
+      insert into audit_logs (id, user_id, user_name, action, description, created_at)
+      values (${newId()}, ${adminId}, ${adminName}, 'provision_admin',
+        'Akun admin dibuat dari environment variable', now())
+    `;
   }
-}
-
-/** Apakah mode demo aktif (untuk menampilkan petunjuk kredensial demo). */
-export async function isDemoMode(): Promise<boolean> {
-  const env = await getEnv();
-  return env.DEMO_MODE === "1" || env.DEMO_MODE === "true" || process.env.NODE_ENV !== "production";
 }
 
 /** Muat data contoh secara manual (persetujuan admin lewat Pengaturan). */
-export async function loadDemoData(db: D1Database, userId: string, userName: string): Promise<void> {
-  const existing = await db
-    .prepare("SELECT COUNT(*) AS n FROM products WHERE deleted_at IS NULL")
-    .first<{ n: number }>();
-  if ((existing?.n ?? 0) > 0) {
+export async function loadDemoData(
+  sql: Database,
+  userId: string,
+  userName: string,
+): Promise<void> {
+  const rows = await sql<{ n: number }[]>`
+    select count(*)::int as n from products where deleted_at is null
+  `;
+  if ((rows[0]?.n ?? 0) > 0) {
     throw new Error("Data barang sudah ada. Data contoh hanya dapat dimuat saat daftar barang masih kosong.");
   }
-  await insertDemoData(db, userId, userName);
+  await insertDemoData(sql, userId, userName);
 }
-

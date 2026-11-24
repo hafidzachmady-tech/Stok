@@ -17,7 +17,37 @@ import type {
   Profile,
 } from "./types";
 
-const ACTIVE = "deleted_at IS NULL";
+const ACTIVE = "deleted_at is null";
+
+function iso(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  return String(value ?? "");
+}
+
+function isoOrNull(value: unknown): string | null {
+  return value ? iso(value) : null;
+}
+
+type ProductRow = Omit<Product, "created_at" | "updated_at" | "deleted_at"> & {
+  created_at: unknown;
+  updated_at: unknown;
+  deleted_at: unknown;
+};
+
+function mapProduct(row: ProductRow): Product {
+  return {
+    ...row,
+    created_at: iso(row.created_at),
+    updated_at: iso(row.updated_at),
+    deleted_at: isoOrNull(row.deleted_at),
+  };
+}
+
+type TransactionRow = Omit<StockTransaction, "created_at"> & { created_at: unknown };
+
+function mapTransaction(row: TransactionRow): StockTransaction {
+  return { ...row, created_at: iso(row.created_at) };
+}
 
 export type DashboardStats = {
   totalBarang: number;
@@ -27,17 +57,19 @@ export type DashboardStats = {
 };
 
 export async function getDashboardStats(): Promise<DashboardStats> {
-  const db = await getDb();
-  const row = await db
-    .prepare(
-      `SELECT
-         COUNT(*) AS total_barang,
-         COALESCE(SUM(stock), 0) AS total_stok,
-         COALESCE(SUM(CASE WHEN stock = 0 THEN 1 ELSE 0 END), 0) AS habis,
-         COALESCE(SUM(CASE WHEN stock > 0 AND stock <= minimum_stock THEN 1 ELSE 0 END), 0) AS menipis
-       FROM products WHERE ${ACTIVE}`,
-    )
-    .first<{ total_barang: number; total_stok: number; habis: number; menipis: number }>();
+  const sql = await getDb();
+  const rows = await sql<
+    { total_barang: number; total_stok: number; menipis: number; habis: number }[]
+  >`
+    select
+      count(*)::int as total_barang,
+      coalesce(sum(stock), 0)::int as total_stok,
+      coalesce(sum(case when stock = 0 then 1 else 0 end), 0)::int as habis,
+      coalesce(sum(case when stock > 0 and stock <= minimum_stock then 1 else 0 end), 0)::int as menipis
+    from products
+    where deleted_at is null
+  `;
+  const row = rows[0];
   return {
     totalBarang: row?.total_barang ?? 0,
     totalStok: row?.total_stok ?? 0,
@@ -56,23 +88,22 @@ export function chartRange(period: ChartPeriod): { startKey: string; endKey: str
 }
 
 export async function getStockChart(period: ChartPeriod): Promise<StockChartData> {
-  const db = await getDb();
+  const sql = await getDb();
   const { startKey, endKey } = chartRange(period);
-  const rows = await db
-    .prepare(
-      `SELECT date(created_at, '+7 hours') AS day,
-              transaction_type AS type,
-              COALESCE(SUM(quantity), 0) AS total
-       FROM stock_transactions
-       WHERE created_at >= ? AND created_at < ?
-         AND transaction_type IN ('masuk','keluar')
-       GROUP BY day, type`,
-    )
-    .bind(jakartaDayStartIso(startKey), jakartaDayStartIso(addDaysToKey(endKey, 1)))
-    .all<{ day: string; type: string; total: number }>();
+  const rows = await sql<{ day: string; type: string; total: number }[]>`
+    select
+      to_char((created_at at time zone 'Asia/Jakarta')::date, 'YYYY-MM-DD') as day,
+      transaction_type as type,
+      coalesce(sum(quantity), 0)::int as total
+    from stock_transactions
+    where created_at >= ${jakartaDayStartIso(startKey)}
+      and created_at < ${jakartaDayStartIso(addDaysToKey(endKey, 1))}
+      and transaction_type in ('masuk', 'keluar')
+    group by 1, 2
+  `;
 
   const map = new Map<string, { masuk: number; keluar: number }>();
-  for (const row of rows.results ?? []) {
+  for (const row of rows) {
     const entry = map.get(row.day) ?? { masuk: 0, keluar: 0 };
     if (row.type === "masuk") entry.masuk += row.total;
     if (row.type === "keluar") entry.keluar += row.total;
@@ -94,17 +125,22 @@ export type AlertProduct = Pick<
 >;
 
 export async function getLowStockProducts(limit?: number): Promise<AlertProduct[]> {
-  const db = await getDb();
-  const limited = limit ? ` LIMIT ${Math.max(1, Math.floor(limit))}` : "";
-  const rows = await db
-    .prepare(
-      `SELECT id, name, product_code, unit, stock, minimum_stock, category
-       FROM products
-       WHERE ${ACTIVE} AND stock <= minimum_stock
-       ORDER BY (stock = 0) DESC, stock ASC, name ASC${limited}`,
-    )
-    .all<AlertProduct>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  const rows = limit
+    ? await sql<AlertProduct[]>`
+        select id, name, product_code, unit, stock, minimum_stock, category
+        from products
+        where deleted_at is null and stock <= minimum_stock
+        order by (stock = 0) desc, stock asc, lower(name) asc
+        limit ${Math.max(1, Math.floor(limit))}
+      `
+    : await sql<AlertProduct[]>`
+        select id, name, product_code, unit, stock, minimum_stock, category
+        from products
+        where deleted_at is null and stock <= minimum_stock
+        order by (stock = 0) desc, stock asc, lower(name) asc
+      `;
+  return rows;
 }
 
 export type RecentActivity = {
@@ -118,26 +154,25 @@ export type RecentActivity = {
 };
 
 export async function getRecentActivity(limit = 6): Promise<RecentActivity[]> {
-  const db = await getDb();
-  const rows = await db
-    .prepare(
-      `SELECT id, product_name, transaction_type, quantity, stock_after, user_name, created_at
-       FROM stock_transactions
-       ORDER BY created_at DESC, rowid DESC
-       LIMIT ?`,
-    )
-    .bind(limit)
-    .all<RecentActivity>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  const rows = await sql<(Omit<RecentActivity, "created_at"> & { created_at: unknown })[]>`
+    select id, product_name, transaction_type, quantity, stock_after, user_name, created_at
+    from stock_transactions
+    order by created_at desc, id desc
+    limit ${limit}
+  `;
+  return rows.map((row) => ({ ...row, created_at: iso(row.created_at) }));
 }
 
 export async function getRecentAuditLogs(limit = 6): Promise<AuditLog[]> {
-  const db = await getDb();
-  const rows = await db
-    .prepare(`SELECT * FROM audit_logs ORDER BY created_at DESC, rowid DESC LIMIT ?`)
-    .bind(limit)
-    .all<AuditLog>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  const rows = await sql<(Omit<AuditLog, "created_at"> & { created_at: unknown })[]>`
+    select id, user_id, user_name, action, description, created_at
+    from audit_logs
+    order by created_at desc, id desc
+    limit ${limit}
+  `;
+  return rows.map((row) => ({ ...row, created_at: iso(row.created_at) }));
 }
 
 export type ProductFilters = {
@@ -149,80 +184,83 @@ export type ProductFilters = {
 };
 
 const SORT_COLUMNS: Record<string, string> = {
-  nama: "name",
+  nama: "lower(name)",
   stok: "stock",
   harga: "selling_price",
   kode: "product_code",
 };
 
 export async function getProducts(filters: ProductFilters): Promise<Product[]> {
-  const db = await getDb();
-  const where: string[] = [ACTIVE];
+  const sql = await getDb();
   const params: unknown[] = [];
+
+  const bind = (value: unknown): string => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  let query = "select * from products where deleted_at is null";
 
   const q = (filters.q ?? "").trim();
   if (q) {
-    where.push("(name LIKE ? OR product_code LIKE ?)");
-    params.push(`%${q}%`, `%${q}%`);
+    const like = bind(`%${q}%`);
+    query += ` and (name ilike ${like} or product_code ilike ${like})`;
   }
+
   const kategori = (filters.kategori ?? "").trim();
   if (kategori && kategori !== "semua") {
-    where.push("category = ?");
-    params.push(kategori);
+    query += ` and category = ${bind(kategori)}`;
   }
+
   const status = filters.status ?? "";
-  if (status === "aman") where.push("stock > minimum_stock");
-  if (status === "menipis") where.push("stock > 0 AND stock <= minimum_stock");
-  if (status === "habis") where.push("stock = 0");
+  if (status === "aman") query += " and stock > minimum_stock";
+  if (status === "menipis") query += " and stock > 0 and stock <= minimum_stock";
+  if (status === "habis") query += " and stock = 0";
 
-  const sortColumn = SORT_COLUMNS[filters.sort ?? "nama"] ?? "name";
-  const direction = filters.dir === "desc" ? "DESC" : "ASC";
+  // Kolom & arah pengurutan berasal dari whitelist sehingga aman.
+  const column = SORT_COLUMNS[filters.sort ?? "nama"] ?? "lower(name)";
+  const direction = filters.dir === "desc" ? "desc" : "asc";
+  query += ` order by ${column} ${direction}, lower(name) asc`;
 
-  const rows = await db
-    .prepare(
-      `SELECT * FROM products WHERE ${where.join(" AND ")} ORDER BY ${sortColumn} ${direction}, name ASC`,
-    )
-    .bind(...params)
-    .all<Product>();
-  return rows.results ?? [];
+  const rows = await sql.unsafe<ProductRow[]>(query, params as never[]);
+  return rows.map(mapProduct);
 }
 
 export async function getCategories(): Promise<string[]> {
-  const db = await getDb();
-  const rows = await db
-    .prepare(
-      `SELECT DISTINCT category FROM products WHERE ${ACTIVE} AND category <> '' ORDER BY category ASC`,
-    )
-    .all<{ category: string }>();
-  return (rows.results ?? []).map((r) => r.category);
+  const sql = await getDb();
+  const rows = await sql<{ category: string }[]>`
+    select distinct category from products
+    where deleted_at is null and category <> ''
+    order by category asc
+  `;
+  return rows.map((row) => row.category);
 }
 
 export async function getProductById(id: string): Promise<Product | null> {
-  const db = await getDb();
-  return db.prepare("SELECT * FROM products WHERE id = ? AND deleted_at IS NULL").bind(id).first<Product>();
+  const sql = await getDb();
+  const rows = await sql<ProductRow[]>`select * from products where id = ${id} and deleted_at is null`;
+  return rows[0] ? mapProduct(rows[0]) : null;
 }
 
 export async function getProductOptions(): Promise<
   Array<Pick<Product, "id" | "product_code" | "name" | "unit" | "stock" | "minimum_stock">>
 > {
-  const db = await getDb();
-  const rows = await db
-    .prepare(
-      `SELECT id, product_code, name, unit, stock, minimum_stock FROM products
-       WHERE ${ACTIVE} ORDER BY name ASC`,
-    )
-    .all<Pick<Product, "id" | "product_code" | "name" | "unit" | "stock" | "minimum_stock">>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  return sql<Array<Pick<Product, "id" | "product_code" | "name" | "unit" | "stock" | "minimum_stock">>>`
+    select id, product_code, name, unit, stock, minimum_stock from products
+    where deleted_at is null
+    order by lower(name) asc
+  `;
 }
 
 export async function getRestockList(): Promise<
   Array<AlertProduct & { recommended: number; status: "menipis" | "habis" }>
 > {
   const items = await getLowStockProducts();
-  return items.map((p) => ({
-    ...p,
-    recommended: Math.max(0, 2 * p.minimum_stock - p.stock),
-    status: p.stock <= 0 ? "habis" : "menipis",
+  return items.map((product) => ({
+    ...product,
+    recommended: Math.max(0, 2 * product.minimum_stock - product.stock),
+    status: product.stock <= 0 ? "habis" : "menipis",
   }));
 }
 
@@ -235,56 +273,58 @@ export type TransactionFilters = {
 };
 
 export async function getTransactions(filters: TransactionFilters): Promise<StockTransaction[]> {
-  const db = await getDb();
-  const where: string[] = ["1 = 1"];
+  const sql = await getDb();
   const params: unknown[] = [];
+
+  const bind = (value: unknown): string => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  let query = "select * from stock_transactions where true";
 
   const q = (filters.q ?? "").trim();
   if (q) {
-    where.push("(product_name LIKE ? OR product_code LIKE ?)");
-    params.push(`%${q}%`, `%${q}%`);
+    const like = bind(`%${q}%`);
+    query += ` and (product_name ilike ${like} or product_code ilike ${like})`;
   }
+
   const jenis = filters.jenis ?? "";
   if (jenis === "masuk" || jenis === "keluar" || jenis === "koreksi") {
-    where.push("transaction_type = ?");
-    params.push(jenis);
+    query += ` and transaction_type = ${bind(jenis)}`;
   }
+
   if (filters.dari) {
-    where.push("created_at >= ?");
-    params.push(jakartaDayStartIso(filters.dari));
+    query += ` and created_at >= ${bind(jakartaDayStartIso(filters.dari))}`;
   }
   if (filters.sampai) {
-    where.push("created_at < ?");
-    params.push(jakartaDayStartIso(addDaysToKey(filters.sampai, 1)));
+    query += ` and created_at < ${bind(jakartaDayStartIso(addDaysToKey(filters.sampai, 1)))}`;
   }
 
   const limit = Math.min(1000, Math.max(1, filters.limit ?? 300));
-  const rows = await db
-    .prepare(
-      `SELECT * FROM stock_transactions WHERE ${where.join(" AND ")}
-       ORDER BY created_at DESC, rowid DESC LIMIT ?`,
-    )
-    .bind(...params, limit)
-    .all<StockTransaction>();
-  return rows.results ?? [];
+  query += ` order by created_at desc, id desc limit ${bind(limit)}`;
+
+  const rows = await sql.unsafe<TransactionRow[]>(query, params as never[]);
+  return rows.map(mapTransaction);
 }
 
 export async function getProfiles(): Promise<Profile[]> {
-  const db = await getDb();
-  const rows = await db
-    .prepare(
-      `SELECT id, full_name, username, role, is_active, created_at FROM profiles
-       ORDER BY (role = 'admin') DESC, created_at ASC`,
-    )
-    .all<Profile>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  const rows = await sql<(Omit<Profile, "created_at"> & { created_at: unknown })[]>`
+    select id, full_name, username, role, is_active, created_at
+    from profiles
+    order by (role = 'admin') desc, created_at asc
+  `;
+  return rows.map((row) => ({ ...row, created_at: iso(row.created_at) }));
 }
 
 export async function getAuditLogs(limit = 50): Promise<AuditLog[]> {
-  const db = await getDb();
-  const rows = await db
-    .prepare("SELECT * FROM audit_logs ORDER BY created_at DESC, rowid DESC LIMIT ?")
-    .bind(limit)
-    .all<AuditLog>();
-  return rows.results ?? [];
+  const sql = await getDb();
+  const rows = await sql<(Omit<AuditLog, "created_at"> & { created_at: unknown })[]>`
+    select id, user_id, user_name, action, description, created_at
+    from audit_logs
+    order by created_at desc, id desc
+    limit ${limit}
+  `;
+  return rows.map((row) => ({ ...row, created_at: iso(row.created_at) }));
 }

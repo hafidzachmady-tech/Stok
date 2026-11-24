@@ -4,7 +4,7 @@ import { LoginForm } from "@/components/LoginForm";
 import { Icon } from "@/components/Icon";
 import { getSessionUser } from "@/lib/auth";
 import { getDb } from "@/lib/db";
-import { isDemoMode } from "@/lib/seed";
+import { isDemoMode } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -14,16 +14,16 @@ export default async function LoginPage() {
   const user = await getSessionUser();
   if (user) redirect("/beranda");
 
-  const demoMode = await isDemoMode();
+  const demoMode = isDemoMode();
 
   // Deteksi database yang belum memiliki akun sama sekali (provisioning belum
   // dijalankan pada deployment produksi) agar admin tidak menemui jalan buntu.
   let needsSetup = false;
   if (!demoMode) {
     try {
-      const db = await getDb();
-      const row = await db.prepare("SELECT COUNT(*) AS n FROM profiles").first<{ n: number }>();
-      needsSetup = (row?.n ?? 0) === 0;
+      const sql = await getDb();
+      const rows = await sql<{ n: number }[]>`select count(*)::int as n from profiles`;
+      needsSetup = (rows[0]?.n ?? 0) === 0;
     } catch {
       needsSetup = false;
     }

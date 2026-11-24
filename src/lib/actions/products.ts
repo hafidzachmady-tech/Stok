@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { auditLog, requireAdmin, requireUser } from "../auth";
+import { auditLog, requireAdmin } from "../auth";
 import { getDb } from "../db";
 import { newId } from "../password";
 import { formatRupiah } from "../format";
@@ -15,6 +15,15 @@ function refreshProductViews() {
   revalidatePath("/stok");
   revalidatePath("/riwayat");
   revalidatePath("/pengaturan");
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: string }).code === "23505"
+  );
 }
 
 type ProductInput = {
@@ -64,11 +73,11 @@ function readInput(formData: FormData): { data: ProductInput } | { error: string
 }
 
 async function assertCodeUnique(code: string, exceptId?: string): Promise<string | null> {
-  const db = await getDb();
-  const existing = await db
-    .prepare("SELECT id FROM products WHERE product_code = ? COLLATE NOCASE")
-    .bind(code)
-    .first<{ id: string }>();
+  const sql = await getDb();
+  const rows = await sql<{ id: string }[]>`
+    select id from products where upper(product_code) = upper(${code})
+  `;
+  const existing = rows[0];
   if (existing && existing.id !== exceptId) {
     return `Kode barang "${code}" sudah digunakan. Gunakan kode lain.`;
   }
@@ -88,110 +97,65 @@ export async function saveProductAction(
   const duplicate = await assertCodeUnique(data.productCode, id || undefined);
   if (duplicate) return { ok: false, error: duplicate };
 
-  const db = await getDb();
-  const nowIso = new Date().toISOString();
+  const sql = await getDb();
 
   try {
     if (id) {
-      const existing = await db
-        .prepare("SELECT id, name FROM products WHERE id = ? AND deleted_at IS NULL")
-        .bind(id)
-        .first<{ id: string; name: string }>();
-      if (!existing) return { ok: false, error: "Barang tidak ditemukan atau sudah dihapus." };
+      const rows = await sql<{ id: string }[]>`
+        select id from products where id = ${id} and deleted_at is null
+      `;
+      if (!rows[0]) return { ok: false, error: "Barang tidak ditemukan atau sudah dihapus." };
 
-      await db
-        .prepare(
-          `UPDATE products SET product_code = ?, name = ?, category = ?, unit = ?,
-             purchase_price = ?, selling_price = ?, minimum_stock = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .bind(
-          data.productCode,
-          data.name,
-          data.category,
-          data.unit,
-          data.purchasePrice,
-          data.sellingPrice,
-          data.minimumStock,
-          nowIso,
-          id,
-        )
-        .run();
-
-      await auditLog(
-        db,
-        user.id,
-        user.full_name,
-        "update_product",
-        `Mengubah data barang ${data.name} (${data.productCode})`,
-      );
+      await sql.begin(async (tx) => {
+        await tx`
+          update products set
+            product_code = ${data.productCode},
+            name = ${data.name},
+            category = ${data.category},
+            unit = ${data.unit},
+            purchase_price = ${data.purchasePrice},
+            selling_price = ${data.sellingPrice},
+            minimum_stock = ${data.minimumStock},
+            updated_at = now()
+          where id = ${id}
+        `;
+        await tx`
+          insert into audit_logs (id, user_id, user_name, action, description, created_at)
+          values (${newId()}, ${user.id}, ${user.full_name}, 'update_product',
+            ${`Mengubah data barang ${data.name} (${data.productCode})`}, now())
+        `;
+      });
       refreshProductViews();
       return { ok: true, message: `Barang "${data.name}" berhasil diperbarui.` };
     }
 
     const productId = newId();
-    const statements = [
-      db
-        .prepare(
-          `INSERT INTO products (id, product_code, name, category, unit, purchase_price, selling_price, stock, minimum_stock, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(
-          productId,
-          data.productCode,
-          data.name,
-          data.category,
-          data.unit,
-          data.purchasePrice,
-          data.sellingPrice,
-          data.stock,
-          data.minimumStock,
-          nowIso,
-          nowIso,
-        ),
-    ];
-
-    if (data.stock > 0) {
-      statements.push(
-        db
-          .prepare(
-            `INSERT INTO stock_transactions (id, product_id, product_name, product_code, transaction_type, quantity, stock_before, stock_after, note, user_id, user_name, created_at)
-             VALUES (?, ?, ?, ?, 'masuk', ?, 0, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            newId(),
-            productId,
-            data.name,
-            data.productCode,
-            data.stock,
-            data.stock,
-            "Stok awal barang baru",
-            user.id,
-            user.full_name,
-            nowIso,
-          ),
-      );
-    }
-
-    statements.push(
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          user.id,
-          user.full_name,
-          "create_product",
-          `Menambahkan barang ${data.name} (${data.productCode}), stok awal ${data.stock}, harga jual ${formatRupiah(data.sellingPrice)}`,
-          nowIso,
-        ),
-    );
-
-    await db.batch(statements);
+    await sql.begin(async (tx) => {
+      await tx`
+        insert into products (id, product_code, name, category, unit, purchase_price, selling_price, stock, minimum_stock, created_at, updated_at)
+        values (${productId}, ${data.productCode}, ${data.name}, ${data.category}, ${data.unit},
+          ${data.purchasePrice}, ${data.sellingPrice}, ${data.stock}, ${data.minimumStock}, now(), now())
+      `;
+      if (data.stock > 0) {
+        await tx`
+          insert into stock_transactions (id, product_id, product_name, product_code, transaction_type, quantity, stock_before, stock_after, note, user_id, user_name, created_at)
+          values (${newId()}, ${productId}, ${data.name}, ${data.productCode}, 'masuk',
+            ${data.stock}, 0, ${data.stock}, 'Stok awal barang baru', ${user.id}, ${user.full_name}, now())
+        `;
+      }
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${user.id}, ${user.full_name}, 'create_product',
+          ${`Menambahkan barang ${data.name} (${data.productCode}), stok awal ${data.stock}, harga jual ${formatRupiah(data.sellingPrice)}`},
+          now())
+      `;
+    });
     refreshProductViews();
     return { ok: true, message: `Barang "${data.name}" berhasil ditambahkan.` };
   } catch (error) {
+    if (isUniqueViolation(error)) {
+      return { ok: false, error: `Kode barang "${data.productCode}" sudah digunakan. Gunakan kode lain.` };
+    }
     console.error("saveProductAction", error);
     return { ok: false, error: "Gagal menyimpan barang. Periksa kembali data lalu coba lagi." };
   }
@@ -201,31 +165,23 @@ export async function deleteProductAction(id: string): Promise<ActionResult> {
   const user = await requireAdmin();
   if (!id) return { ok: false, error: "Barang tidak ditemukan." };
 
-  const db = await getDb();
-  const product = await db
-    .prepare("SELECT id, name, product_code FROM products WHERE id = ? AND deleted_at IS NULL")
-    .bind(id)
-    .first<{ id: string; name: string; product_code: string }>();
+  const sql = await getDb();
+  const rows = await sql<{ id: string; name: string; product_code: string }[]>`
+    select id, name, product_code from products where id = ${id} and deleted_at is null
+  `;
+  const product = rows[0];
   if (!product) return { ok: false, error: "Barang tidak ditemukan atau sudah dihapus." };
 
-  const nowIso = new Date().toISOString();
   try {
-    await db.batch([
-      // Hapus lunak: riwayat transaksi tetap utuh dan dapat diaudit.
-      db.prepare("UPDATE products SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(nowIso, nowIso, id),
-      db
-        .prepare(
-          "INSERT INTO audit_logs (id, user_id, user_name, action, description, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          newId(),
-          user.id,
-          user.full_name,
-          "delete_product",
-          `Menghapus barang ${product.name} (${product.product_code})`,
-          nowIso,
-        ),
-    ]);
+    // Hapus lunak: riwayat transaksi tetap utuh dan dapat diaudit.
+    await sql.begin(async (tx) => {
+      await tx`update products set deleted_at = now(), updated_at = now() where id = ${id}`;
+      await tx`
+        insert into audit_logs (id, user_id, user_name, action, description, created_at)
+        values (${newId()}, ${user.id}, ${user.full_name}, 'delete_product',
+          ${`Menghapus barang ${product.name} (${product.product_code})`}, now())
+      `;
+    });
     refreshProductViews();
     return { ok: true, message: `Barang "${product.name}" berhasil dihapus.` };
   } catch (error) {
@@ -233,4 +189,3 @@ export async function deleteProductAction(id: string): Promise<ActionResult> {
     return { ok: false, error: "Gagal menghapus barang. Coba lagi." };
   }
 }
-

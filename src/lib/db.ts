@@ -1,75 +1,161 @@
-import type { D1Database } from "@cloudflare/workers-types";
-import { getEnv } from "./env";
+import postgres from "postgres";
+import { getDatabaseUrl } from "./env";
 import { seedDefaults } from "./seed";
 
+export type Database = ReturnType<typeof postgres>;
+
 /**
- * Skema database. Dijalankan secara idempoten (CREATE ... IF NOT EXISTS)
- * oleh server saat pertama kali dipakai, sehingga deployment baru selalu
- * memiliki struktur tabel yang benar tanpa perlu akses SQL manual.
+ * Skema PostgreSQL. Dijalankan idempoten oleh server saat pertama kali
+ * dipakai, sehingga deployment baru (Vercel + Supabase) langsung memiliki
+ * struktur tabel yang benar. Salinan SQL yang sama tersedia di
+ * db/schema.sql untuk dijalankan manual di Supabase SQL Editor.
  */
 const SCHEMA_STATEMENTS: string[] = [
-  `CREATE TABLE IF NOT EXISTS profiles ( id TEXT PRIMARY KEY, full_name TEXT NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('admin','penjaga')), is_active INTEGER NOT NULL DEFAULT 1, failed_attempts INTEGER NOT NULL DEFAULT 0, locked_until INTEGER, created_at TEXT NOT NULL )`,
-  `CREATE TABLE IF NOT EXISTS sessions ( id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE, created_at TEXT NOT NULL, expires_at INTEGER NOT NULL )`,
-  `CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)`,
-  `CREATE TABLE IF NOT EXISTS products ( id TEXT PRIMARY KEY, product_code TEXT NOT NULL COLLATE NOCASE UNIQUE, name TEXT NOT NULL, category TEXT NOT NULL, unit TEXT NOT NULL, purchase_price INTEGER NOT NULL DEFAULT 0 CHECK (purchase_price >= 0), selling_price INTEGER NOT NULL DEFAULT 0 CHECK (selling_price >= 0), stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0), minimum_stock INTEGER NOT NULL DEFAULT 0 CHECK (minimum_stock >= 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT )`,
-  `CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)`,
-  `CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)`,
-  `CREATE INDEX IF NOT EXISTS idx_products_deleted ON products(deleted_at)`,
-  `CREATE TABLE IF NOT EXISTS stock_transactions ( id TEXT PRIMARY KEY, product_id TEXT NOT NULL REFERENCES products(id) ON DELETE RESTRICT, product_name TEXT NOT NULL, product_code TEXT NOT NULL, transaction_type TEXT NOT NULL CHECK (transaction_type IN ('masuk','keluar','koreksi')), quantity INTEGER NOT NULL CHECK (quantity > 0), stock_before INTEGER NOT NULL CHECK (stock_before >= 0), stock_after INTEGER NOT NULL CHECK (stock_after >= 0), note TEXT, user_id TEXT NOT NULL REFERENCES profiles(id), user_name TEXT NOT NULL, created_at TEXT NOT NULL )`,
-  `CREATE INDEX IF NOT EXISTS idx_tx_product ON stock_transactions(product_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_tx_created ON stock_transactions(created_at DESC)`,
-  `CREATE INDEX IF NOT EXISTS idx_tx_type ON stock_transactions(transaction_type)`,
-  `CREATE TABLE IF NOT EXISTS audit_logs ( id TEXT PRIMARY KEY, user_id TEXT, user_name TEXT NOT NULL, action TEXT NOT NULL, description TEXT NOT NULL, created_at TEXT NOT NULL )`,
-  `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)`,
-  `CREATE TABLE IF NOT EXISTS settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL )`,
+  `create table if not exists profiles (
+    id text primary key,
+    full_name text not null,
+    username text not null unique,
+    password_hash text not null,
+    role text not null check (role in ('admin', 'penjaga')),
+    is_active integer not null default 1,
+    failed_attempts integer not null default 0,
+    locked_until bigint,
+    created_at timestamptz not null default now()
+  )`,
+  `create table if not exists sessions (
+    id text primary key,
+    user_id text not null references profiles (id) on delete cascade,
+    created_at timestamptz not null default now(),
+    expires_at bigint not null
+  )`,
+  `create index if not exists idx_sessions_user on sessions (user_id)`,
+  `create table if not exists products (
+    id text primary key,
+    product_code text not null,
+    name text not null,
+    category text not null,
+    unit text not null,
+    purchase_price integer not null default 0 check (purchase_price >= 0),
+    selling_price integer not null default 0 check (selling_price >= 0),
+    stock integer not null default 0 check (stock >= 0),
+    minimum_stock integer not null default 0 check (minimum_stock >= 0),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    deleted_at timestamptz
+  )`,
+  `create unique index if not exists ux_products_code on products (upper(product_code))`,
+  `create index if not exists idx_products_name on products (lower(name))`,
+  `create index if not exists idx_products_category on products (category)`,
+  `create index if not exists idx_products_deleted on products (deleted_at)`,
+  `create table if not exists stock_transactions (
+    id text primary key,
+    product_id text not null references products (id) on delete restrict,
+    product_name text not null,
+    product_code text not null,
+    transaction_type text not null check (transaction_type in ('masuk', 'keluar', 'koreksi')),
+    quantity integer not null check (quantity > 0),
+    stock_before integer not null check (stock_before >= 0),
+    stock_after integer not null check (stock_after >= 0),
+    note text,
+    user_id text not null references profiles (id),
+    user_name text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists idx_tx_product on stock_transactions (product_id)`,
+  `create index if not exists idx_tx_created on stock_transactions (created_at desc)`,
+  `create index if not exists idx_tx_type on stock_transactions (transaction_type)`,
+  `create table if not exists audit_logs (
+    id text primary key,
+    user_id text references profiles (id) on delete set null,
+    user_name text not null,
+    action text not null,
+    description text not null,
+    created_at timestamptz not null default now()
+  )`,
+  `create index if not exists idx_audit_created on audit_logs (created_at desc)`,
+  `create table if not exists settings (
+    key text primary key,
+    value text not null
+  )`,
+  // Akses langsung via PostgREST/anon ditutup; aplikasi hanya memakai koneksi server.
+  `alter table profiles enable row level security`,
+  `alter table sessions enable row level security`,
+  `alter table products enable row level security`,
+  `alter table stock_transactions enable row level security`,
+  `alter table audit_logs enable row level security`,
+  `alter table settings enable row level security`,
 ];
 
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "pg-1";
 
+const globalState = globalThis as unknown as {
+  __tokokelontongSql?: Database;
+  __tokokelontongSchema?: Promise<void>;
+};
 
-let schemaReady: Promise<void> | null = null;
+function buildClient(url: string): Database {
+  const host = (() => {
+    try {
+      return new URL(url).hostname;
+    } catch {
+      return "";
+    }
+  })();
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1" || host.endsWith(".internal");
+  const sslDisabled = /sslmode=disable/.test(url);
 
-async function schemaUpToDate(db: D1Database): Promise<boolean> {
+  return postgres(url, {
+    // Serverless: satu koneksi per instance fungsi, tanpa prepared statement
+    // agar kompatibel dengan connection pooler Supabase (Supavisor).
+    max: Number(process.env.DATABASE_POOL_MAX || 1),
+    idle_timeout: 20,
+    connect_timeout: 15,
+    prepare: false,
+    ssl: sslDisabled || isLocal ? false : true,
+    onnotice: () => {},
+  });
+}
+
+export function getSql(): Database {
+  if (!globalState.__tokokelontongSql) {
+    globalState.__tokokelontongSql = buildClient(getDatabaseUrl());
+  }
+  return globalState.__tokokelontongSql;
+}
+
+async function schemaUpToDate(sql: Database): Promise<boolean> {
   try {
-    const row = await db
-      .prepare("SELECT value FROM settings WHERE key = 'schema_version'")
-      .first<{ value: string }>();
-    return row?.value === SCHEMA_VERSION;
+    const rows = await sql<{ value: string }[]>`select value from settings where key = 'schema_version'`;
+    return rows[0]?.value === SCHEMA_VERSION;
   } catch {
     return false;
   }
 }
 
-async function init(db: D1Database): Promise<void> {
-  if (!(await schemaUpToDate(db))) {
-    // DDL dijalankan per pernyataan agar kompatibel dengan D1 (exec multi-baris
-    // tidak dapat diandalkan untuk CREATE TABLE).
+async function init(sql: Database): Promise<void> {
+  if (!(await schemaUpToDate(sql))) {
     for (const statement of SCHEMA_STATEMENTS) {
-      await db.prepare(statement).run();
+      await sql.unsafe(statement);
     }
-    await db
-      .prepare(
-        "INSERT INTO settings (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      )
-      .bind(SCHEMA_VERSION)
-      .run();
+    await sql`
+      insert into settings (key, value) values ('schema_version', ${SCHEMA_VERSION})
+      on conflict (key) do update set value = excluded.value
+    `;
   }
-  await seedDefaults(db);
+  await seedDefaults(sql);
 }
 
-export async function getDb(): Promise<D1Database> {
-  const env = await getEnv();
-  if (!env.DB) {
-    throw new Error("Binding database DB tidak tersedia.");
-  }
-  if (!schemaReady) {
-    schemaReady = init(env.DB).catch((err) => {
-      schemaReady = null;
-      throw err;
+/** Koneksi database yang siap dipakai (skema & data awal sudah dipastikan ada). */
+export async function getDb(): Promise<Database> {
+  const sql = getSql();
+  if (!globalState.__tokokelontongSchema) {
+    globalState.__tokokelontongSchema = init(sql).catch((error) => {
+      globalState.__tokokelontongSchema = undefined;
+      throw error;
     });
   }
-  await schemaReady;
-  return env.DB;
+  await globalState.__tokokelontongSchema;
+  return sql;
 }
 
 export type StoreSettings = {
@@ -80,11 +166,9 @@ export type StoreSettings = {
 };
 
 export async function getSettings(): Promise<StoreSettings> {
-  const db = await getDb();
-  const rows = await db
-    .prepare("SELECT key, value FROM settings")
-    .all<{ key: string; value: string }>();
-  const map = new Map((rows.results ?? []).map((r) => [r.key, r.value]));
+  const sql = await getDb();
+  const rows = await sql<{ key: string; value: string }[]>`select key, value from settings`;
+  const map = new Map(rows.map((row) => [row.key, row.value]));
   return {
     store_name: map.get("store_name") ?? "TokoKelontong",
     store_address: map.get("store_address") ?? "",
